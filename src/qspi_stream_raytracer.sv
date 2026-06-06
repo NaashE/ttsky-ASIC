@@ -103,56 +103,6 @@ module qspi_stream_raytracer (
         (voxel_y > SCENE_MAX) |
         (voxel_z > SCENE_MAX);
 
-    function [7:0] packet_byte;
-        input [1:0] packet;
-        input [3:0] index;
-        begin
-            packet_byte = 8'h00;
-            case (packet)
-                2'd0: begin
-                    case (index)
-                        4'd0: packet_byte = status_byte;
-                        4'd1: packet_byte = step_count;
-                        default: packet_byte = 8'h00;
-                    endcase
-                end
-                2'd1: begin
-                    case (index)
-                        4'd0: packet_byte = {2'b00, voxel_x};
-                        4'd1: packet_byte = {2'b00, voxel_y};
-                        4'd2: packet_byte = {2'b00, voxel_z};
-                        4'd3: packet_byte = step_count;
-                        4'd4: packet_byte = {5'b00000, face_id};
-                        default: packet_byte = 8'h00;
-                    endcase
-                end
-                default: begin
-                    case (index)
-                        4'd0: packet_byte = status_byte;
-                        4'd1: packet_byte = {2'b00, voxel_x};
-                        4'd2: packet_byte = {2'b00, voxel_y};
-                        4'd3: packet_byte = {2'b00, voxel_z};
-                        4'd4: packet_byte = step_count;
-                        4'd5: packet_byte = {5'b00000, face_id};
-                        4'd6: packet_byte = pixel_id;
-                        default: packet_byte = 8'h00;
-                    endcase
-                end
-            endcase
-        end
-    endfunction
-
-    function [3:0] packet_nibble;
-        input [1:0] packet;
-        input [3:0] index;
-        input       high_half;
-        reg [7:0] value;
-        begin
-            value = packet_byte(packet, index);
-            packet_nibble = high_half ? value[7:4] : value[3:0];
-        end
-    endfunction
-
     task clear_engine;
         begin
             voxel_x        <= 6'd0;
@@ -190,7 +140,49 @@ module qspi_stream_raytracer (
             tx_index  <= 4'd0;
             tx_packet <= packet;
             tx_len    <= length;
-            tx_nibble <= packet_nibble(packet, 4'd0, 1'b1);
+            set_tx_nibble(packet, 4'd0, 1'b1);
+        end
+    endtask
+
+    task set_tx_nibble;
+        input [1:0] packet;
+        input [3:0] index;
+        input       high_half;
+        reg [7:0] value;
+        begin
+            value = 8'h00;
+            case (packet)
+                2'd0: begin
+                    case (index)
+                        4'd0: value = status_byte;
+                        4'd1: value = step_count;
+                        default: value = 8'h00;
+                    endcase
+                end
+                2'd1: begin
+                    case (index)
+                        4'd0: value = {2'b00, voxel_x};
+                        4'd1: value = {2'b00, voxel_y};
+                        4'd2: value = {2'b00, voxel_z};
+                        4'd3: value = step_count;
+                        4'd4: value = {5'b00000, face_id};
+                        default: value = 8'h00;
+                    endcase
+                end
+                default: begin
+                    case (index)
+                        4'd0: value = status_byte;
+                        4'd1: value = {2'b00, voxel_x};
+                        4'd2: value = {2'b00, voxel_y};
+                        4'd3: value = {2'b00, voxel_z};
+                        4'd4: value = step_count;
+                        4'd5: value = {5'b00000, face_id};
+                        4'd6: value = pixel_id;
+                        default: value = 8'h00;
+                    endcase
+                end
+            endcase
+            tx_nibble <= high_half ? value[7:4] : value[3:0];
         end
     endtask
 
@@ -334,10 +326,29 @@ module qspi_stream_raytracer (
             end
 
             if (sck_rise && !tx_active) begin
-                if (!cmd_half) begin
+                if (receiving_payload) begin
+                    if (!payload_half) begin
+                        payload_hi   <= dq_sync;
+                        payload_half <= 1'b1;
+                    end else begin
+                        payload_half <= 1'b0;
+                        if (active_cmd == CMD_WRITE_CONTEXT) begin
+                            accept_context_byte(payload_index, {payload_hi, dq_sync});
+                            payload_index <= payload_index + 5'd1;
+                            if (payload_index == (CONTEXT_BYTES - 5'd1)) begin
+                                receiving_payload <= 1'b0;
+                            end
+                        end else if (active_cmd == CMD_WRITE_VOXEL) begin
+                            voxel_occupied    <= dq_sync[0];
+                            voxel_valid       <= 1'b1;
+                            needs_voxel       <= 1'b0;
+                            receiving_payload <= 1'b0;
+                        end
+                    end
+                end else if (!cmd_half) begin
                     cmd_shift <= {dq_sync, 4'h0};
                     cmd_half  <= 1'b1;
-                end else if (!receiving_payload) begin
+                end else begin
                     active_cmd <= {cmd_shift[7:4], dq_sync};
                     cmd_half   <= 1'b0;
                     case ({cmd_shift[7:4], dq_sync})
@@ -368,29 +379,12 @@ module qspi_stream_raytracer (
                         end
                         default: begin end
                     endcase
-                end else if (!payload_half) begin
-                    payload_hi   <= dq_sync;
-                    payload_half <= 1'b1;
-                end else begin
-                    payload_half <= 1'b0;
-                    if (active_cmd == CMD_WRITE_CONTEXT) begin
-                        accept_context_byte(payload_index, {payload_hi, dq_sync});
-                        payload_index <= payload_index + 5'd1;
-                        if (payload_index == (CONTEXT_BYTES - 5'd1)) begin
-                            receiving_payload <= 1'b0;
-                        end
-                    end else if (active_cmd == CMD_WRITE_VOXEL) begin
-                        voxel_occupied    <= dq_sync[0];
-                        voxel_valid       <= 1'b1;
-                        needs_voxel       <= 1'b0;
-                        receiving_payload <= 1'b0;
-                    end
                 end
             end
 
             if (sck_fall && tx_active) begin
                 if (!tx_phase) begin
-                    tx_nibble <= packet_nibble(tx_packet, tx_index, 1'b0);
+                    set_tx_nibble(tx_packet, tx_index, 1'b0);
                     tx_phase  <= 1'b1;
                 end else begin
                     tx_phase <= 1'b0;
@@ -399,7 +393,7 @@ module qspi_stream_raytracer (
                         tx_nibble <= 4'd0;
                     end else begin
                         tx_index  <= tx_index + 4'd1;
-                        tx_nibble <= packet_nibble(tx_packet, tx_index + 4'd1, 1'b1);
+                        set_tx_nibble(tx_packet, tx_index + 4'd1, 1'b1);
                     end
                 end
             end
