@@ -45,6 +45,10 @@ def context_payload(pixel_id):
     ]
 
 
+def cache_fill_payload(ctx_id, tag_x, tag_y, tag_z, tile_bytes):
+    return [ctx_id, tag_x, tag_y, tag_z] + tile_bytes
+
+
 @cocotb.test()
 async def test_qspi_stream_smoke(dut):
     dut.ena.value = 1
@@ -63,25 +67,24 @@ async def test_qspi_stream_smoke(dut):
 
     assert status(dut) & 0x01  # at least one active context
     assert status(dut) & 0x02  # at least one free slot remains
-    assert status(dut) & 0x04  # at least one voxel request exists
+    assert status(dut) & 0x04  # at least one tile-fill request exists
 
     await qspi_transaction(dut, [0x10] + context_payload(0x33))
     assert status(dut) & 0x01
     assert status(dut) & 0x02
     assert status(dut) & 0x04
 
-    await qspi_transaction(dut, [0x20, 0x00, 0x00])  # ctx 0, empty voxel
+    # Fill ctx 0's owned cache bank with tile (0,0,0). Bit 0 is empty and
+    # bit 1 is solid, so ctx 0 can step once and then finish without another
+    # host-side cache fill.
+    await qspi_transaction(dut, [0x20] + cache_fill_payload(
+        0x00, 0x00, 0x00, 0x00,
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02],
+    ))
     assert status(dut) & 0x20  # one context is ready to step
 
-    await qspi_transaction(dut, [0x30])  # step ctx 0 once
-    assert status(dut) & 0x01
-    assert status(dut) & 0x04
-    assert (status(dut) & 0x08) == 0
-
-    await qspi_transaction(dut, [0x20, 0x00, 0x01])  # ctx 0, occupied voxel
-    assert status(dut) & 0x20
-
-    await qspi_transaction(dut, [0x30])  # ctx 0 finishes, ctx 1 remains active
+    await qspi_transaction(dut, [0x31, 0x02])  # run two cached steps autonomously
+    await ClockCycles(dut.clk, 20)
     assert status(dut) & 0x01
     assert status(dut) & 0x02
     assert status(dut) & 0x08  # result available

@@ -1,9 +1,9 @@
 // =============================================================================
 // Streaming QSPI voxel ray stepper with five in-flight ray contexts.
 //
-// Scene storage remains off chip. The host streams voxel occupancy responses by
-// context id, while the ASIC keeps several ray contexts live and schedules one
-// ready context per STEP command.
+// Scene storage remains off chip. The host streams 4x4x4 aligned voxel tiles
+// into context-owned cache banks. Every context can read all cache banks, but
+// context N can only refill bank N.
 // =============================================================================
 `default_nettype none
 
@@ -20,8 +20,9 @@ module qspi_stream_raytracer (
 
     localparam [7:0] CMD_RESET         = 8'h00;
     localparam [7:0] CMD_WRITE_CONTEXT = 8'h10;
-    localparam [7:0] CMD_WRITE_VOXEL   = 8'h20;
+    localparam [7:0] CMD_FILL_CACHE    = 8'h20;
     localparam [7:0] CMD_STEP          = 8'h30;
+    localparam [7:0] CMD_RUN_N         = 8'h31;
     localparam [7:0] CMD_READ_STATUS   = 8'h40;
     localparam [7:0] CMD_READ_REQUEST  = 8'h41;
     localparam [7:0] CMD_READ_RESULT   = 8'h42;
@@ -58,7 +59,7 @@ module qspi_stream_raytracer (
     reg [4:0] payload_index;
     reg       receiving_payload;
     reg [2:0] load_slot;
-    reg [2:0] voxel_slot;
+    reg [2:0] fill_slot;
 
     reg       tx_active;
     reg       tx_phase;
@@ -84,12 +85,19 @@ module qspi_stream_raytracer (
     reg [7:0]  ctx_step_count [0:4];
     reg [2:0]  ctx_face_id [0:4];
     reg        ctx_valid [0:4];
-    reg        ctx_needs_voxel [0:4];
-    reg        ctx_voxel_valid [0:4];
-    reg        ctx_voxel_occupied [0:4];
+    reg        ctx_needs_tile [0:4];
+
+    reg        cache_valid [0:4];
+    reg [3:0]  cache_tag_x [0:4];
+    reg [3:0]  cache_tag_y [0:4];
+    reg [3:0]  cache_tag_z [0:4];
+    reg [63:0] cache_bits [0:4];
 
     reg [2:0] sched_ptr;
     reg       error_flag;
+    reg       run_active;
+    reg [8:0] run_budget;
+    reg [2:0] stop_reason;
 
     reg [2:0] result_ctx [0:3];
     reg [7:0] result_status [0:3];
@@ -124,6 +132,8 @@ module qspi_stream_raytracer (
         any_active
     };
 
+    wire qspi_rx_event = sck_rise && !tx_active;
+
     always @* begin
         integer i;
         free_found = 1'b0;
@@ -140,7 +150,7 @@ module qspi_stream_raytracer (
                 free_found = 1'b1;
                 free_id = i;
             end
-            if (!request_found && ctx_valid[i] && ctx_needs_voxel[i]) begin
+            if (!request_found && ctx_valid[i] && ctx_needs_tile[i]) begin
                 request_found = 1'b1;
                 request_id = i;
             end
@@ -157,7 +167,7 @@ module qspi_stream_raytracer (
             if (probe >= NUM_CONTEXTS) begin
                 probe = probe - NUM_CONTEXTS;
             end
-            if (!ready_found && ctx_valid[probe] && ctx_voxel_valid[probe] && !ctx_needs_voxel[probe] && !result_full) begin
+            if (!ready_found && ctx_valid[probe] && !ctx_needs_tile[probe] && !result_full) begin
                 ready_found = 1'b1;
                 ready_id = probe;
             end
@@ -184,9 +194,18 @@ module qspi_stream_raytracer (
             ctx_step_count[idx]     <= 8'd0;
             ctx_face_id[idx]        <= 3'd0;
             ctx_valid[idx]          <= 1'b0;
-            ctx_needs_voxel[idx]    <= 1'b0;
-            ctx_voxel_valid[idx]    <= 1'b0;
-            ctx_voxel_occupied[idx] <= 1'b0;
+            ctx_needs_tile[idx]     <= 1'b0;
+        end
+    endtask
+
+    task clear_cache;
+        input [2:0] idx;
+        begin
+            cache_valid[idx] <= 1'b0;
+            cache_tag_x[idx] <= 4'd0;
+            cache_tag_y[idx] <= 4'd0;
+            cache_tag_z[idx] <= 4'd0;
+            cache_bits[idx]  <= 64'd0;
         end
     endtask
 
@@ -195,6 +214,7 @@ module qspi_stream_raytracer (
         begin
             for (k = 0; k < 5; k = k + 1) begin
                 clear_context(k);
+                clear_cache(k);
             end
             for (k = 0; k < 4; k = k + 1) begin
                 result_ctx[k]      <= 3'd0;
@@ -211,6 +231,9 @@ module qspi_stream_raytracer (
             result_count  <= 3'd0;
             sched_ptr     <= 3'd0;
             error_flag    <= 1'b0;
+            run_active    <= 1'b0;
+            run_budget    <= 9'd0;
+            stop_reason   <= 3'd0;
         end
     endtask
 
@@ -266,15 +289,16 @@ module qspi_stream_raytracer (
                         4'd1: value = free_found ? {5'b00000, free_id} : 8'hff;
                         4'd2: value = request_found ? {5'b00000, request_id} : 8'hff;
                         4'd3: value = {5'b00000, result_count};
+                        4'd4: value = {1'b0, stop_reason, 3'b000, run_active};
                         default: value = 8'h00;
                     endcase
                 end
                 2'd1: begin
                     case (index)
                         4'd0: value = request_found ? {5'b00000, request_id} : 8'hff;
-                        4'd1: value = request_found ? {2'b00, ctx_voxel_x[request_id]} : 8'h00;
-                        4'd2: value = request_found ? {2'b00, ctx_voxel_y[request_id]} : 8'h00;
-                        4'd3: value = request_found ? {2'b00, ctx_voxel_z[request_id]} : 8'h00;
+                        4'd1: value = request_found ? {4'b0000, ctx_voxel_x[request_id][5:2]} : 8'h00;
+                        4'd2: value = request_found ? {4'b0000, ctx_voxel_y[request_id][5:2]} : 8'h00;
+                        4'd3: value = request_found ? {4'b0000, ctx_voxel_z[request_id][5:2]} : 8'h00;
                         default: value = 8'h00;
                     endcase
                 end
@@ -341,29 +365,40 @@ module qspi_stream_raytracer (
                     ctx_step_count[idx]     <= 8'd0;
                     ctx_face_id[idx]        <= 3'd0;
                     ctx_valid[idx]          <= 1'b1;
-                    ctx_needs_voxel[idx]    <= 1'b1;
-                    ctx_voxel_valid[idx]    <= 1'b0;
-                    ctx_voxel_occupied[idx] <= 1'b0;
+                    ctx_needs_tile[idx]     <= 1'b1;
                 end
                 default: begin end
             endcase
         end
     endtask
 
-    task accept_voxel_byte;
+    task accept_cache_byte;
         input [4:0] index;
         input [7:0] value;
         begin
             if (index == 5'd0) begin
-                voxel_slot <= value[2:0];
-            end else if (index == 5'd1) begin
-                if ((voxel_slot < NUM_CONTEXTS) && ctx_valid[voxel_slot] && ctx_needs_voxel[voxel_slot]) begin
-                    ctx_voxel_occupied[voxel_slot] <= value[0];
-                    ctx_voxel_valid[voxel_slot]    <= 1'b1;
-                    ctx_needs_voxel[voxel_slot]    <= 1'b0;
-                end else begin
-                    error_flag <= 1'b1;
-                end
+                fill_slot <= value[2:0];
+            end else if ((fill_slot < NUM_CONTEXTS) && ctx_valid[fill_slot]) begin
+                case (index)
+                    5'd1: cache_tag_x[fill_slot] <= value[3:0];
+                    5'd2: cache_tag_y[fill_slot] <= value[3:0];
+                    5'd3: cache_tag_z[fill_slot] <= value[3:0];
+                    5'd4: cache_bits[fill_slot][63:56] <= value;
+                    5'd5: cache_bits[fill_slot][55:48] <= value;
+                    5'd6: cache_bits[fill_slot][47:40] <= value;
+                    5'd7: cache_bits[fill_slot][39:32] <= value;
+                    5'd8: cache_bits[fill_slot][31:24] <= value;
+                    5'd9: cache_bits[fill_slot][23:16] <= value;
+                    5'd10: cache_bits[fill_slot][15:8] <= value;
+                    5'd11: begin
+                        cache_bits[fill_slot][7:0] <= value;
+                        cache_valid[fill_slot] <= 1'b1;
+                        ctx_needs_tile[fill_slot] <= 1'b0;
+                    end
+                    default: begin end
+                endcase
+            end else begin
+                error_flag <= 1'b1;
             end
         end
     endtask
@@ -377,10 +412,36 @@ module qspi_stream_raytracer (
         reg [5:0] next_z;
         reg [7:0] next_step;
         reg [2:0] next_face;
+        reg [5:0] bit_index;
+        reg       cache_hit;
+        reg       cached_occupied;
+        integer bank;
         begin
-            if (ctx_valid[idx] && ctx_voxel_valid[idx] && !ctx_needs_voxel[idx] && !result_full) begin
+            if (ctx_valid[idx] && !ctx_needs_tile[idx] && !result_full) begin
+                bit_index = {
+                    ctx_voxel_z[idx][1:0],
+                    ctx_voxel_y[idx][1:0],
+                    ctx_voxel_x[idx][1:0]
+                };
+                cache_hit = 1'b0;
+                cached_occupied = 1'b0;
+                for (bank = 0; bank < 5; bank = bank + 1) begin
+                    if (!cache_hit &&
+                        cache_valid[bank] &&
+                        (cache_tag_x[bank] == ctx_voxel_x[idx][5:2]) &&
+                        (cache_tag_y[bank] == ctx_voxel_y[idx][5:2]) &&
+                        (cache_tag_z[bank] == ctx_voxel_z[idx][5:2])) begin
+                        cache_hit = 1'b1;
+                        cached_occupied = cache_bits[bank][bit_index];
+                    end
+                end
+
+                if (!cache_hit) begin
+                    ctx_needs_tile[idx] <= 1'b1;
+                    sched_ptr <= (idx == (NUM_CONTEXTS - 3'd1)) ? 3'd0 : (idx + 3'd1);
+                end else begin
                 next_step = ctx_step_count[idx] + 8'd1;
-                if (ctx_voxel_occupied[idx]) begin
+                if (cached_occupied) begin
                     push_result(idx, 1'b1, 1'b0, ctx_voxel_x[idx], ctx_voxel_y[idx], ctx_voxel_z[idx], ctx_face_id[idx]);
                 end else if ((ctx_voxel_x[idx] > SCENE_MAX) ||
                              (ctx_voxel_y[idx] > SCENE_MAX) ||
@@ -414,8 +475,7 @@ module qspi_stream_raytracer (
                     ctx_voxel_z[idx]     <= next_z;
                     ctx_step_count[idx]  <= next_step;
                     ctx_face_id[idx]     <= next_face;
-                    ctx_voxel_valid[idx] <= 1'b0;
-                    ctx_needs_voxel[idx] <= 1'b1;
+                    ctx_needs_tile[idx]  <= 1'b0;
 
                     if ((next_x > SCENE_MAX) || (next_y > SCENE_MAX) || (next_z > SCENE_MAX)) begin
                         ctx_face_id[idx] <= next_face;
@@ -423,6 +483,7 @@ module qspi_stream_raytracer (
                     end
                 end
                 sched_ptr <= (idx == (NUM_CONTEXTS - 3'd1)) ? 3'd0 : (idx + 3'd1);
+                end
             end else begin
                 error_flag <= 1'b1;
             end
@@ -447,7 +508,10 @@ module qspi_stream_raytracer (
             payload_index     <= 5'd0;
             receiving_payload <= 1'b0;
             load_slot         <= 3'd0;
-            voxel_slot        <= 3'd0;
+            fill_slot         <= 3'd0;
+            run_active        <= 1'b0;
+            run_budget        <= 9'd0;
+            stop_reason       <= 3'd0;
             tx_active         <= 1'b0;
             tx_phase          <= 1'b0;
             tx_nibble         <= 4'd0;
@@ -473,7 +537,7 @@ module qspi_stream_raytracer (
                 tx_nibble         <= 4'd0;
             end
 
-            if (sck_rise && !tx_active) begin
+            if (qspi_rx_event) begin
                 if (receiving_payload) begin
                     if (!payload_half) begin
                         payload_hi   <= dq_sync;
@@ -486,12 +550,17 @@ module qspi_stream_raytracer (
                             if (payload_index == (CONTEXT_BYTES - 5'd1)) begin
                                 receiving_payload <= 1'b0;
                             end
-                        end else if (active_cmd == CMD_WRITE_VOXEL) begin
-                            accept_voxel_byte(payload_index, {payload_hi, dq_sync});
+                        end else if (active_cmd == CMD_FILL_CACHE) begin
+                            accept_cache_byte(payload_index, {payload_hi, dq_sync});
                             payload_index <= payload_index + 5'd1;
-                            if (payload_index == 5'd1) begin
+                            if (payload_index == 5'd11) begin
                                 receiving_payload <= 1'b0;
                             end
+                        end else if (active_cmd == CMD_RUN_N) begin
+                            run_budget <= ({payload_hi, dq_sync} == 8'd0) ? 9'd256 : {1'b0, payload_hi, dq_sync};
+                            run_active <= 1'b1;
+                            stop_reason <= 3'd0;
+                            receiving_payload <= 1'b0;
                         end
                     end
                 end else if (!cmd_half) begin
@@ -514,7 +583,7 @@ module qspi_stream_raytracer (
                                 error_flag <= 1'b1;
                             end
                         end
-                        CMD_WRITE_VOXEL: begin
+                        CMD_FILL_CACHE: begin
                             receiving_payload <= 1'b1;
                             payload_index <= 5'd0;
                             payload_half <= 1'b0;
@@ -526,11 +595,16 @@ module qspi_stream_raytracer (
                                 error_flag <= 1'b1;
                             end
                         end
+                        CMD_RUN_N: begin
+                            receiving_payload <= 1'b1;
+                            payload_index <= 5'd0;
+                            payload_half <= 1'b0;
+                        end
                         CMD_POP_RESULT: begin
                             pop_result();
                         end
                         CMD_READ_STATUS: begin
-                            start_tx(2'd0, 4'd4);
+                            start_tx(2'd0, 4'd5);
                         end
                         CMD_READ_REQUEST: begin
                             start_tx(2'd1, 4'd4);
@@ -557,6 +631,26 @@ module qspi_stream_raytracer (
                     end else begin
                         tx_index <= tx_index + 4'd1;
                         set_tx_nibble(tx_packet, tx_index + 4'd1, 1'b1);
+                    end
+                end
+            end
+
+            if (run_active && cs_sync && !tx_active) begin
+                if (result_full) begin
+                    run_active <= 1'b0;
+                    stop_reason <= 3'd1;
+                end else if (!ready_found) begin
+                    run_active <= 1'b0;
+                    stop_reason <= request_found ? 3'd2 : 3'd3;
+                end else if (run_budget == 9'd0) begin
+                    run_active <= 1'b0;
+                    stop_reason <= 3'd4;
+                end else begin
+                    run_step_for_ctx(ready_id);
+                    run_budget <= run_budget - 9'd1;
+                    if (run_budget == 9'd1) begin
+                        run_active <= 1'b0;
+                        stop_reason <= 3'd4;
                     end
                 end
             end
