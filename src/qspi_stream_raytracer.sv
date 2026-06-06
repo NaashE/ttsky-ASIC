@@ -1,9 +1,9 @@
 // =============================================================================
-// Streaming QSPI voxel ray stepper.
+// Streaming QSPI voxel ray stepper with five in-flight ray contexts.
 //
-// This implementation intentionally keeps all large scene storage off chip. The
-// host streams one voxel occupancy bit at a time, the ASIC advances one DDA step,
-// and the host reads back the next coordinate or final result.
+// Scene storage remains off chip. The host streams voxel occupancy responses by
+// context id, while the ASIC keeps several ray contexts live and schedules one
+// ready context per STEP command.
 // =============================================================================
 `default_nettype none
 
@@ -23,9 +23,12 @@ module qspi_stream_raytracer (
     localparam [7:0] CMD_WRITE_VOXEL   = 8'h20;
     localparam [7:0] CMD_STEP          = 8'h30;
     localparam [7:0] CMD_READ_STATUS   = 8'h40;
-    localparam [7:0] CMD_READ_COORDS   = 8'h41;
+    localparam [7:0] CMD_READ_REQUEST  = 8'h41;
     localparam [7:0] CMD_READ_RESULT   = 8'h42;
+    localparam [7:0] CMD_POP_RESULT    = 8'h43;
 
+    localparam [2:0] NUM_CONTEXTS = 3'd5;
+    localparam [2:0] RESULT_DEPTH = 3'd4;
     localparam [5:0] SCENE_MAX = 6'd31;
     localparam [4:0] CONTEXT_BYTES = 5'd18;
 
@@ -54,6 +57,8 @@ module qspi_stream_raytracer (
     reg [3:0] payload_hi;
     reg [4:0] payload_index;
     reg       receiving_payload;
+    reg [2:0] load_slot;
+    reg [2:0] voxel_slot;
 
     reg       tx_active;
     reg       tx_phase;
@@ -62,72 +67,232 @@ module qspi_stream_raytracer (
     reg [1:0] tx_packet;
     reg [3:0] tx_len;
 
-    reg [5:0] voxel_x;
-    reg [5:0] voxel_y;
-    reg [5:0] voxel_z;
-    reg       step_x_neg;
-    reg       step_y_neg;
-    reg       step_z_neg;
-    reg [15:0] timer_x;
-    reg [15:0] timer_y;
-    reg [15:0] timer_z;
-    reg [15:0] inc_x;
-    reg [15:0] inc_y;
-    reg [15:0] inc_z;
-    reg [7:0] max_steps;
-    reg [7:0] pixel_id;
-    reg [7:0] step_count;
-    reg [2:0] face_id;
+    reg [5:0]  ctx_voxel_x [0:4];
+    reg [5:0]  ctx_voxel_y [0:4];
+    reg [5:0]  ctx_voxel_z [0:4];
+    reg        ctx_step_x_neg [0:4];
+    reg        ctx_step_y_neg [0:4];
+    reg        ctx_step_z_neg [0:4];
+    reg [15:0] ctx_timer_x [0:4];
+    reg [15:0] ctx_timer_y [0:4];
+    reg [15:0] ctx_timer_z [0:4];
+    reg [15:0] ctx_inc_x [0:4];
+    reg [15:0] ctx_inc_y [0:4];
+    reg [15:0] ctx_inc_z [0:4];
+    reg [7:0]  ctx_max_steps [0:4];
+    reg [7:0]  ctx_pixel_id [0:4];
+    reg [7:0]  ctx_step_count [0:4];
+    reg [2:0]  ctx_face_id [0:4];
+    reg        ctx_valid [0:4];
+    reg        ctx_needs_voxel [0:4];
+    reg        ctx_voxel_valid [0:4];
+    reg        ctx_voxel_occupied [0:4];
 
-    reg active;
-    reg needs_voxel;
-    reg voxel_valid;
-    reg voxel_occupied;
-    reg result_valid;
-    reg result_hit;
-    reg result_timeout;
+    reg [2:0] sched_ptr;
+    reg       error_flag;
+
+    reg [2:0] result_ctx [0:3];
+    reg [7:0] result_status [0:3];
+    reg [7:0] result_pixel_id [0:3];
+    reg [5:0] result_x [0:3];
+    reg [5:0] result_y [0:3];
+    reg [5:0] result_z [0:3];
+    reg [7:0] result_steps [0:3];
+    reg [2:0] result_face [0:3];
+    reg [1:0] result_wr_ptr;
+    reg [1:0] result_rd_ptr;
+    reg [2:0] result_count;
+
+    reg free_found;
+    reg [2:0] free_id;
+    reg request_found;
+    reg [2:0] request_id;
+    reg ready_found;
+    reg [2:0] ready_id;
+    reg any_active;
+
+    wire result_full = (result_count == 3'd4);
 
     wire [7:0] status_byte = {
-        1'b0,
+        error_flag,
         tx_active,
-        active & ~result_valid,
-        result_timeout,
-        result_hit,
-        result_valid,
-        needs_voxel,
-        active
+        ready_found,
+        !free_found,
+        (result_count != 3'd0),
+        request_found,
+        free_found,
+        any_active
     };
 
-    wire out_of_bounds =
-        (voxel_x > SCENE_MAX) |
-        (voxel_y > SCENE_MAX) |
-        (voxel_z > SCENE_MAX);
+    always @* begin
+        integer i;
+        free_found = 1'b0;
+        free_id = 3'd0;
+        request_found = 1'b0;
+        request_id = 3'd0;
+        any_active = 1'b0;
+
+        for (i = 0; i < 5; i = i + 1) begin
+            if (ctx_valid[i]) begin
+                any_active = 1'b1;
+            end
+            if (!free_found && !ctx_valid[i]) begin
+                free_found = 1'b1;
+                free_id = i;
+            end
+            if (!request_found && ctx_valid[i] && ctx_needs_voxel[i]) begin
+                request_found = 1'b1;
+                request_id = i;
+            end
+        end
+    end
+
+    always @* begin
+        integer j;
+        reg [2:0] probe;
+        ready_found = 1'b0;
+        ready_id = sched_ptr;
+        for (j = 0; j < 5; j = j + 1) begin
+            probe = sched_ptr + j;
+            if (probe >= NUM_CONTEXTS) begin
+                probe = probe - NUM_CONTEXTS;
+            end
+            if (!ready_found && ctx_valid[probe] && ctx_voxel_valid[probe] && !ctx_needs_voxel[probe] && !result_full) begin
+                ready_found = 1'b1;
+                ready_id = probe;
+            end
+        end
+    end
+
+    task clear_context;
+        input [2:0] idx;
+        begin
+            ctx_voxel_x[idx]        <= 6'd0;
+            ctx_voxel_y[idx]        <= 6'd0;
+            ctx_voxel_z[idx]        <= 6'd0;
+            ctx_step_x_neg[idx]     <= 1'b0;
+            ctx_step_y_neg[idx]     <= 1'b0;
+            ctx_step_z_neg[idx]     <= 1'b0;
+            ctx_timer_x[idx]        <= 16'd0;
+            ctx_timer_y[idx]        <= 16'd0;
+            ctx_timer_z[idx]        <= 16'd0;
+            ctx_inc_x[idx]          <= 16'd0;
+            ctx_inc_y[idx]          <= 16'd0;
+            ctx_inc_z[idx]          <= 16'd0;
+            ctx_max_steps[idx]      <= 8'd0;
+            ctx_pixel_id[idx]       <= 8'd0;
+            ctx_step_count[idx]     <= 8'd0;
+            ctx_face_id[idx]        <= 3'd0;
+            ctx_valid[idx]          <= 1'b0;
+            ctx_needs_voxel[idx]    <= 1'b0;
+            ctx_voxel_valid[idx]    <= 1'b0;
+            ctx_voxel_occupied[idx] <= 1'b0;
+        end
+    endtask
 
     task clear_engine;
+        integer k;
         begin
-            voxel_x        <= 6'd0;
-            voxel_y        <= 6'd0;
-            voxel_z        <= 6'd0;
-            step_x_neg     <= 1'b0;
-            step_y_neg     <= 1'b0;
-            step_z_neg     <= 1'b0;
-            timer_x        <= 16'd0;
-            timer_y        <= 16'd0;
-            timer_z        <= 16'd0;
-            inc_x          <= 16'd0;
-            inc_y          <= 16'd0;
-            inc_z          <= 16'd0;
-            max_steps      <= 8'd0;
-            pixel_id       <= 8'd0;
-            step_count     <= 8'd0;
-            face_id        <= 3'd0;
-            active         <= 1'b0;
-            needs_voxel    <= 1'b0;
-            voxel_valid    <= 1'b0;
-            voxel_occupied <= 1'b0;
-            result_valid   <= 1'b0;
-            result_hit     <= 1'b0;
-            result_timeout <= 1'b0;
+            for (k = 0; k < 5; k = k + 1) begin
+                clear_context(k);
+            end
+            for (k = 0; k < 4; k = k + 1) begin
+                result_ctx[k]      <= 3'd0;
+                result_status[k]   <= 8'd0;
+                result_pixel_id[k] <= 8'd0;
+                result_x[k]        <= 6'd0;
+                result_y[k]        <= 6'd0;
+                result_z[k]        <= 6'd0;
+                result_steps[k]    <= 8'd0;
+                result_face[k]     <= 3'd0;
+            end
+            result_wr_ptr <= 2'd0;
+            result_rd_ptr <= 2'd0;
+            result_count  <= 3'd0;
+            sched_ptr     <= 3'd0;
+            error_flag    <= 1'b0;
+        end
+    endtask
+
+    task push_result;
+        input [2:0] idx;
+        input       hit;
+        input       timeout;
+        input [5:0] x_value;
+        input [5:0] y_value;
+        input [5:0] z_value;
+        input [2:0] face_value;
+        begin
+            if (!result_full) begin
+                result_ctx[result_wr_ptr]      <= idx;
+                result_status[result_wr_ptr]   <= {6'b000000, timeout, hit};
+                result_pixel_id[result_wr_ptr] <= ctx_pixel_id[idx];
+                result_x[result_wr_ptr]        <= x_value;
+                result_y[result_wr_ptr]        <= y_value;
+                result_z[result_wr_ptr]        <= z_value;
+                result_steps[result_wr_ptr]    <= ctx_step_count[idx] + 8'd1;
+                result_face[result_wr_ptr]     <= face_value;
+                result_wr_ptr                  <= result_wr_ptr + 2'd1;
+                result_count                   <= result_count + 3'd1;
+                clear_context(idx);
+            end else begin
+                error_flag <= 1'b1;
+            end
+        end
+    endtask
+
+    task pop_result;
+        begin
+            if (result_count != 3'd0) begin
+                result_rd_ptr <= result_rd_ptr + 2'd1;
+                result_count  <= result_count - 3'd1;
+            end else begin
+                error_flag <= 1'b1;
+            end
+        end
+    endtask
+
+    task set_tx_nibble;
+        input [1:0] packet;
+        input [3:0] index;
+        input       high_half;
+        reg [7:0] value;
+        begin
+            value = 8'h00;
+            case (packet)
+                2'd0: begin
+                    case (index)
+                        4'd0: value = status_byte;
+                        4'd1: value = free_found ? {5'b00000, free_id} : 8'hff;
+                        4'd2: value = request_found ? {5'b00000, request_id} : 8'hff;
+                        4'd3: value = {5'b00000, result_count};
+                        default: value = 8'h00;
+                    endcase
+                end
+                2'd1: begin
+                    case (index)
+                        4'd0: value = request_found ? {5'b00000, request_id} : 8'hff;
+                        4'd1: value = request_found ? {2'b00, ctx_voxel_x[request_id]} : 8'h00;
+                        4'd2: value = request_found ? {2'b00, ctx_voxel_y[request_id]} : 8'h00;
+                        4'd3: value = request_found ? {2'b00, ctx_voxel_z[request_id]} : 8'h00;
+                        default: value = 8'h00;
+                    endcase
+                end
+                default: begin
+                    case (index)
+                        4'd0: value = (result_count != 3'd0) ? {5'b00000, result_ctx[result_rd_ptr]} : 8'hff;
+                        4'd1: value = (result_count != 3'd0) ? result_status[result_rd_ptr] : 8'h00;
+                        4'd2: value = (result_count != 3'd0) ? result_pixel_id[result_rd_ptr] : 8'h00;
+                        4'd3: value = (result_count != 3'd0) ? {2'b00, result_x[result_rd_ptr]} : 8'h00;
+                        4'd4: value = (result_count != 3'd0) ? {2'b00, result_y[result_rd_ptr]} : 8'h00;
+                        4'd5: value = (result_count != 3'd0) ? {2'b00, result_z[result_rd_ptr]} : 8'h00;
+                        4'd6: value = (result_count != 3'd0) ? result_steps[result_rd_ptr] : 8'h00;
+                        4'd7: value = (result_count != 3'd0) ? {5'b00000, result_face[result_rd_ptr]} : 8'h00;
+                        default: value = 8'h00;
+                    endcase
+                end
+            endcase
+            tx_nibble <= high_half ? value[7:4] : value[3:0];
         end
     endtask
 
@@ -144,141 +309,122 @@ module qspi_stream_raytracer (
         end
     endtask
 
-    task set_tx_nibble;
-        input [1:0] packet;
-        input [3:0] index;
-        input       high_half;
-        reg [7:0] value;
-        begin
-            value = 8'h00;
-            case (packet)
-                2'd0: begin
-                    case (index)
-                        4'd0: value = status_byte;
-                        4'd1: value = step_count;
-                        default: value = 8'h00;
-                    endcase
-                end
-                2'd1: begin
-                    case (index)
-                        4'd0: value = {2'b00, voxel_x};
-                        4'd1: value = {2'b00, voxel_y};
-                        4'd2: value = {2'b00, voxel_z};
-                        4'd3: value = step_count;
-                        4'd4: value = {5'b00000, face_id};
-                        default: value = 8'h00;
-                    endcase
-                end
-                default: begin
-                    case (index)
-                        4'd0: value = status_byte;
-                        4'd1: value = {2'b00, voxel_x};
-                        4'd2: value = {2'b00, voxel_y};
-                        4'd3: value = {2'b00, voxel_z};
-                        4'd4: value = step_count;
-                        4'd5: value = {5'b00000, face_id};
-                        4'd6: value = pixel_id;
-                        default: value = 8'h00;
-                    endcase
-                end
-            endcase
-            tx_nibble <= high_half ? value[7:4] : value[3:0];
-        end
-    endtask
-
     task accept_context_byte;
+        input [2:0] idx;
         input [4:0] index;
         input [7:0] value;
         begin
             case (index)
-                5'd0:  voxel_x    <= value[5:0];
-                5'd1:  voxel_y    <= value[5:0];
-                5'd2:  voxel_z    <= value[5:0];
+                5'd0:  ctx_voxel_x[idx]    <= value[5:0];
+                5'd1:  ctx_voxel_y[idx]    <= value[5:0];
+                5'd2:  ctx_voxel_z[idx]    <= value[5:0];
                 5'd3:  begin
-                    step_x_neg <= value[0];
-                    step_y_neg <= value[1];
-                    step_z_neg <= value[2];
+                    ctx_step_x_neg[idx] <= value[0];
+                    ctx_step_y_neg[idx] <= value[1];
+                    ctx_step_z_neg[idx] <= value[2];
                 end
-                5'd4:  timer_x[15:8] <= value;
-                5'd5:  timer_x[7:0]  <= value;
-                5'd6:  timer_y[15:8] <= value;
-                5'd7:  timer_y[7:0]  <= value;
-                5'd8:  timer_z[15:8] <= value;
-                5'd9:  timer_z[7:0]  <= value;
-                5'd10: inc_x[15:8]   <= value;
-                5'd11: inc_x[7:0]    <= value;
-                5'd12: inc_y[15:8]   <= value;
-                5'd13: inc_y[7:0]    <= value;
-                5'd14: inc_z[15:8]   <= value;
-                5'd15: inc_z[7:0]    <= value;
-                5'd16: max_steps     <= value;
+                5'd4:  ctx_timer_x[idx][15:8] <= value;
+                5'd5:  ctx_timer_x[idx][7:0]  <= value;
+                5'd6:  ctx_timer_y[idx][15:8] <= value;
+                5'd7:  ctx_timer_y[idx][7:0]  <= value;
+                5'd8:  ctx_timer_z[idx][15:8] <= value;
+                5'd9:  ctx_timer_z[idx][7:0]  <= value;
+                5'd10: ctx_inc_x[idx][15:8]   <= value;
+                5'd11: ctx_inc_x[idx][7:0]    <= value;
+                5'd12: ctx_inc_y[idx][15:8]   <= value;
+                5'd13: ctx_inc_y[idx][7:0]    <= value;
+                5'd14: ctx_inc_z[idx][15:8]   <= value;
+                5'd15: ctx_inc_z[idx][7:0]    <= value;
+                5'd16: ctx_max_steps[idx]     <= value;
                 5'd17: begin
-                    pixel_id       <= value;
-                    step_count     <= 8'd0;
-                    face_id        <= 3'd0;
-                    active         <= 1'b1;
-                    needs_voxel    <= 1'b1;
-                    voxel_valid    <= 1'b0;
-                    result_valid   <= 1'b0;
-                    result_hit     <= 1'b0;
-                    result_timeout <= 1'b0;
+                    ctx_pixel_id[idx]       <= value;
+                    ctx_step_count[idx]     <= 8'd0;
+                    ctx_face_id[idx]        <= 3'd0;
+                    ctx_valid[idx]          <= 1'b1;
+                    ctx_needs_voxel[idx]    <= 1'b1;
+                    ctx_voxel_valid[idx]    <= 1'b0;
+                    ctx_voxel_occupied[idx] <= 1'b0;
                 end
                 default: begin end
             endcase
         end
     endtask
 
-    task run_step;
+    task accept_voxel_byte;
+        input [4:0] index;
+        input [7:0] value;
+        begin
+            if (index == 5'd0) begin
+                voxel_slot <= value[2:0];
+            end else if (index == 5'd1) begin
+                if ((voxel_slot < NUM_CONTEXTS) && ctx_valid[voxel_slot] && ctx_needs_voxel[voxel_slot]) begin
+                    ctx_voxel_occupied[voxel_slot] <= value[0];
+                    ctx_voxel_valid[voxel_slot]    <= 1'b1;
+                    ctx_needs_voxel[voxel_slot]    <= 1'b0;
+                end else begin
+                    error_flag <= 1'b1;
+                end
+            end
+        end
+    endtask
+
+    task run_step_for_ctx;
+        input [2:0] idx;
         reg choose_x;
         reg choose_y;
         reg [5:0] next_x;
         reg [5:0] next_y;
         reg [5:0] next_z;
+        reg [7:0] next_step;
+        reg [2:0] next_face;
         begin
-            if (active && voxel_valid && !result_valid) begin
-                if (voxel_occupied) begin
-                    result_valid <= 1'b1;
-                    result_hit   <= 1'b1;
-                    needs_voxel  <= 1'b0;
-                end else if (out_of_bounds || (step_count >= max_steps)) begin
-                    result_valid   <= 1'b1;
-                    result_timeout <= 1'b1;
-                    needs_voxel    <= 1'b0;
+            if (ctx_valid[idx] && ctx_voxel_valid[idx] && !ctx_needs_voxel[idx] && !result_full) begin
+                next_step = ctx_step_count[idx] + 8'd1;
+                if (ctx_voxel_occupied[idx]) begin
+                    push_result(idx, 1'b1, 1'b0, ctx_voxel_x[idx], ctx_voxel_y[idx], ctx_voxel_z[idx], ctx_face_id[idx]);
+                end else if ((ctx_voxel_x[idx] > SCENE_MAX) ||
+                             (ctx_voxel_y[idx] > SCENE_MAX) ||
+                             (ctx_voxel_z[idx] > SCENE_MAX) ||
+                             (next_step >= ctx_max_steps[idx])) begin
+                    push_result(idx, 1'b0, 1'b1, ctx_voxel_x[idx], ctx_voxel_y[idx], ctx_voxel_z[idx], ctx_face_id[idx]);
                 end else begin
-                    choose_x = (timer_x <= timer_y) && (timer_x <= timer_z);
-                    choose_y = (timer_y <  timer_x) && (timer_y <= timer_z);
-                    next_x = voxel_x;
-                    next_y = voxel_y;
-                    next_z = voxel_z;
+                    choose_x = (ctx_timer_x[idx] <= ctx_timer_y[idx]) && (ctx_timer_x[idx] <= ctx_timer_z[idx]);
+                    choose_y = (ctx_timer_y[idx] <  ctx_timer_x[idx]) && (ctx_timer_y[idx] <= ctx_timer_z[idx]);
+                    next_x = ctx_voxel_x[idx];
+                    next_y = ctx_voxel_y[idx];
+                    next_z = ctx_voxel_z[idx];
+                    next_face = ctx_face_id[idx];
 
                     if (choose_x) begin
-                        next_x = step_x_neg ? (voxel_x - 6'd1) : (voxel_x + 6'd1);
-                        timer_x <= timer_x + inc_x;
-                        face_id <= step_x_neg ? 3'd1 : 3'd2;
+                        next_x = ctx_step_x_neg[idx] ? (ctx_voxel_x[idx] - 6'd1) : (ctx_voxel_x[idx] + 6'd1);
+                        ctx_timer_x[idx] <= ctx_timer_x[idx] + ctx_inc_x[idx];
+                        next_face = ctx_step_x_neg[idx] ? 3'd1 : 3'd2;
                     end else if (choose_y) begin
-                        next_y = step_y_neg ? (voxel_y - 6'd1) : (voxel_y + 6'd1);
-                        timer_y <= timer_y + inc_y;
-                        face_id <= step_y_neg ? 3'd3 : 3'd4;
+                        next_y = ctx_step_y_neg[idx] ? (ctx_voxel_y[idx] - 6'd1) : (ctx_voxel_y[idx] + 6'd1);
+                        ctx_timer_y[idx] <= ctx_timer_y[idx] + ctx_inc_y[idx];
+                        next_face = ctx_step_y_neg[idx] ? 3'd3 : 3'd4;
                     end else begin
-                        next_z = step_z_neg ? (voxel_z - 6'd1) : (voxel_z + 6'd1);
-                        timer_z <= timer_z + inc_z;
-                        face_id <= step_z_neg ? 3'd5 : 3'd6;
+                        next_z = ctx_step_z_neg[idx] ? (ctx_voxel_z[idx] - 6'd1) : (ctx_voxel_z[idx] + 6'd1);
+                        ctx_timer_z[idx] <= ctx_timer_z[idx] + ctx_inc_z[idx];
+                        next_face = ctx_step_z_neg[idx] ? 3'd5 : 3'd6;
                     end
 
-                    voxel_x     <= next_x;
-                    voxel_y     <= next_y;
-                    voxel_z     <= next_z;
-                    step_count  <= step_count + 8'd1;
-                    voxel_valid <= 1'b0;
-                    needs_voxel <= 1'b1;
+                    ctx_voxel_x[idx]     <= next_x;
+                    ctx_voxel_y[idx]     <= next_y;
+                    ctx_voxel_z[idx]     <= next_z;
+                    ctx_step_count[idx]  <= next_step;
+                    ctx_face_id[idx]     <= next_face;
+                    ctx_voxel_valid[idx] <= 1'b0;
+                    ctx_needs_voxel[idx] <= 1'b1;
 
-                    if ((next_x > SCENE_MAX) || (next_y > SCENE_MAX) || (next_z > SCENE_MAX) ||
-                        ((step_count + 8'd1) >= max_steps)) begin
-                        result_valid   <= 1'b1;
-                        result_timeout <= 1'b1;
-                        needs_voxel    <= 1'b0;
+                    if ((next_x > SCENE_MAX) || (next_y > SCENE_MAX) || (next_z > SCENE_MAX)) begin
+                        ctx_face_id[idx] <= next_face;
+                        push_result(idx, 1'b0, 1'b1, next_x, next_y, next_z, next_face);
                     end
                 end
+                sched_ptr <= (idx == (NUM_CONTEXTS - 3'd1)) ? 3'd0 : (idx + 3'd1);
+            end else begin
+                error_flag <= 1'b1;
             end
         end
     endtask
@@ -300,6 +446,8 @@ module qspi_stream_raytracer (
             payload_hi        <= 4'd0;
             payload_index     <= 5'd0;
             receiving_payload <= 1'b0;
+            load_slot         <= 3'd0;
+            voxel_slot        <= 3'd0;
             tx_active         <= 1'b0;
             tx_phase          <= 1'b0;
             tx_nibble         <= 4'd0;
@@ -333,16 +481,17 @@ module qspi_stream_raytracer (
                     end else begin
                         payload_half <= 1'b0;
                         if (active_cmd == CMD_WRITE_CONTEXT) begin
-                            accept_context_byte(payload_index, {payload_hi, dq_sync});
+                            accept_context_byte(load_slot, payload_index, {payload_hi, dq_sync});
                             payload_index <= payload_index + 5'd1;
                             if (payload_index == (CONTEXT_BYTES - 5'd1)) begin
                                 receiving_payload <= 1'b0;
                             end
                         end else if (active_cmd == CMD_WRITE_VOXEL) begin
-                            voxel_occupied    <= dq_sync[0];
-                            voxel_valid       <= 1'b1;
-                            needs_voxel       <= 1'b0;
-                            receiving_payload <= 1'b0;
+                            accept_voxel_byte(payload_index, {payload_hi, dq_sync});
+                            payload_index <= payload_index + 5'd1;
+                            if (payload_index == 5'd1) begin
+                                receiving_payload <= 1'b0;
+                            end
                         end
                     end
                 end else if (!cmd_half) begin
@@ -356,28 +505,42 @@ module qspi_stream_raytracer (
                             clear_engine();
                         end
                         CMD_WRITE_CONTEXT: begin
-                            receiving_payload <= 1'b1;
-                            payload_index     <= 5'd0;
-                            payload_half      <= 1'b0;
+                            if (free_found) begin
+                                load_slot <= free_id;
+                                receiving_payload <= 1'b1;
+                                payload_index <= 5'd0;
+                                payload_half <= 1'b0;
+                            end else begin
+                                error_flag <= 1'b1;
+                            end
                         end
                         CMD_WRITE_VOXEL: begin
                             receiving_payload <= 1'b1;
-                            payload_index     <= 5'd0;
-                            payload_half      <= 1'b0;
+                            payload_index <= 5'd0;
+                            payload_half <= 1'b0;
                         end
                         CMD_STEP: begin
-                            run_step();
+                            if (ready_found) begin
+                                run_step_for_ctx(ready_id);
+                            end else begin
+                                error_flag <= 1'b1;
+                            end
+                        end
+                        CMD_POP_RESULT: begin
+                            pop_result();
                         end
                         CMD_READ_STATUS: begin
-                            start_tx(2'd0, 4'd2);
+                            start_tx(2'd0, 4'd4);
                         end
-                        CMD_READ_COORDS: begin
-                            start_tx(2'd1, 4'd5);
+                        CMD_READ_REQUEST: begin
+                            start_tx(2'd1, 4'd4);
                         end
                         CMD_READ_RESULT: begin
-                            start_tx(2'd2, 4'd7);
+                            start_tx(2'd2, 4'd8);
                         end
-                        default: begin end
+                        default: begin
+                            error_flag <= 1'b1;
+                        end
                     endcase
                 end
             end
@@ -385,14 +548,14 @@ module qspi_stream_raytracer (
             if (sck_fall && tx_active) begin
                 if (!tx_phase) begin
                     set_tx_nibble(tx_packet, tx_index, 1'b0);
-                    tx_phase  <= 1'b1;
+                    tx_phase <= 1'b1;
                 end else begin
                     tx_phase <= 1'b0;
                     if ((tx_index + 4'd1) >= tx_len) begin
                         tx_active <= 1'b0;
                         tx_nibble <= 4'd0;
                     end else begin
-                        tx_index  <= tx_index + 4'd1;
+                        tx_index <= tx_index + 4'd1;
                         set_tx_nibble(tx_packet, tx_index + 4'd1, 1'b1);
                     end
                 end
@@ -402,7 +565,7 @@ module qspi_stream_raytracer (
 
     assign uio_out = {4'h0, tx_nibble};
     assign uio_oe  = {4'h0, {4{tx_active}}};
-    assign uo_out  = status_byte;
+    assign uo_out  = ena ? status_byte : 8'h00;
 
 endmodule
 
