@@ -57,6 +57,14 @@ def sample_qspi_nibble(dut):
     return int(dut.uio_out.value) & 0x0F
 
 
+async def wait_for_qspi_drive(dut, max_cycles=20):
+    for _ in range(max_cycles):
+        if (int(dut.uio_oe.value) & 0x0F) == 0x0F:
+            return
+        await ClockCycles(dut.clk, 1)
+    sample_qspi_nibble(dut)
+
+
 async def qspi_read(dut, command, num_bytes):
     await qspi_set(dut, 1, 0, 0)
     await qspi_set(dut, 0, 0, 0)
@@ -67,9 +75,13 @@ async def qspi_read(dut, command, num_bytes):
     await qspi_set(dut, 0, 0, low)
     await qspi_set(dut, 0, 1, low)
 
+    await wait_for_qspi_drive(dut)
+    await ClockCycles(dut.clk, 2)
     nibbles = [sample_qspi_nibble(dut)]
     for _ in range(num_bytes * 2 - 1):
         await qspi_set(dut, 0, 0, 0)
+        await wait_for_qspi_drive(dut)
+        await ClockCycles(dut.clk, 2)
         nibbles.append(sample_qspi_nibble(dut))
         await qspi_set(dut, 0, 1, 0)
 
@@ -183,7 +195,8 @@ async def fill_cache(dut, req, scene):
 
 async def run_n(dut, budget):
     await qspi_write(dut, [CMD_RUN_N, budget & 0xFF])
-    await ClockCycles(dut.clk, 12)
+    run_cycles = 256 if budget == 0 else budget
+    await ClockCycles(dut.clk, run_cycles + 20)
 
 
 async def pop_result(dut):
@@ -243,6 +256,9 @@ async def render_sphere_32x32(dut):
 
     await reset_dut(dut)
 
+    reset_status = await read_status(dut)
+    assert reset_status["raw"] & STATUS_FREE, f"bad reset status/read alignment: {reset_status}"
+
     scene = make_sphere_scene()
     image = [[0 for _ in range(IMG_W)] for _ in range(IMG_H)]
     next_pixel = 0
@@ -254,6 +270,8 @@ async def render_sphere_32x32(dut):
     rays_loaded = 0
     ctx_to_pixel = {}
     max_iters = 200000
+    last_progress = max_iters
+    last_status = None
 
     while results < IMG_W * IMG_H:
         status = await read_status(dut)
@@ -267,6 +285,7 @@ async def render_sphere_32x32(dut):
             ctx_to_pixel[ctx_id] = next_pixel
             next_pixel += 1
             rays_loaded += 1
+            last_progress = max_iters
             status = await read_status(dut)
 
         while status["raw"] & STATUS_REQUEST:
@@ -274,11 +293,13 @@ async def render_sphere_32x32(dut):
             assert req["ctx"] < 5, f"invalid request context {req}"
             await fill_cache(dut, req, scene)
             tile_fills += 1
+            last_progress = max_iters
             status = await read_status(dut)
 
         if status["raw"] & STATUS_READY:
             await run_n(dut, 0)
             run_commands += 1
+            last_progress = max_iters
             status = await read_status(dut)
 
         while status["raw"] & STATUS_RESULT:
@@ -294,10 +315,29 @@ async def render_sphere_32x32(dut):
                 misses += 1
             results += 1
             await pop_result(dut)
+            last_progress = max_iters
             status = await read_status(dut)
 
         max_iters -= 1
-        assert max_iters > 0, "render loop did not converge"
+        if max_iters % 5000 == 0:
+            dut._log.info(
+                "render progress: loaded=%d results=%d hits=%d misses=%d fills=%d runs=%d status=%s active_ctx=%s",
+                rays_loaded,
+                results,
+                hits,
+                misses,
+                tile_fills,
+                run_commands,
+                status,
+                sorted(ctx_to_pixel.items()),
+            )
+        last_status = status
+        assert max_iters > 0 and (last_progress - max_iters) < 20000, (
+            "render loop stalled: "
+            f"loaded={rays_loaded} results={results} hits={hits} misses={misses} "
+            f"fills={tile_fills} runs={run_commands} status={last_status} "
+            f"active_ctx={sorted(ctx_to_pixel.items())}"
+        )
 
     out_dir = os.path.join(os.getcwd(), "sim_build", "render")
     os.makedirs(out_dir, exist_ok=True)
