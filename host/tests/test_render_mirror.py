@@ -1,8 +1,8 @@
 """End-to-end render with mirrors, traced entirely through the RTL model.
 
 Runs the same bounce loop main() does, so the reflection bookkeeping (per-ray
-origins, throughput, view vectors after a bounce) is exercised before any of
-it reaches hardware. Shadows are left on for the terminal hits.
+origins, throughput) is exercised before any of it reaches hardware. Shadows
+are left on for the terminal hits.
 """
 import os
 import sys
@@ -97,13 +97,8 @@ def main():
     hit_pt = rf.ray_hit_points(cur_org[sh_idx], cur_dir[sh_idx],
                                r_pos[sh_idx], r_face[sh_idx])
     origins = rf.shadow_origins(hit_pt, r_face[sh_idx])
-    view = -cur_dir[sh_idx] / np.linalg.norm(cur_dir[sh_idx], axis=1,
-                                             keepdims=True)
-    gloss = rf.SPEC_STRENGTH[mats[sh_idx]]
-    power = rf.SPEC_POWER[mats[sh_idx]]
 
     illum = np.zeros((total, 3))
-    spec = np.zeros((total, 3))
     rng = np.random.default_rng(rf.JITTER_SEED)
     for stratum in rf.LIGHT_STRATA:
         lpos = rf.jitter_strata(stratum, sh_idx.size, rng)
@@ -124,25 +119,14 @@ def main():
         illum[rows, 0] += cr * w
         illum[rows, 1] += cg * w
         illum[rows, 2] += cb * w
-        g = gloss[m]
-        if g.any():
-            hv = d[m] / dist[m][:, None] + view[m]
-            hn = np.linalg.norm(hv, axis=1)
-            nd = np.maximum((normals[m] * hv).sum(axis=1)
-                            / np.maximum(hn, 1e-9), 0.0)
-            s = g * np.power(nd, power[m]) * w
-            spec[rows, 0] += cr * s
-            spec[rows, 1] += cg * s
-            spec[rows, 2] += cb * s
 
     illum *= throughput
-    spec *= throughput
     image = np.zeros((total, 3), np.uint8)
     image[lamp] = np.clip(np.rint(palette[mats[lamp]] * throughput[lamp] * 255),
                           0, 255).astype(np.uint8)
     albedo = np.zeros((total, 3))
     albedo[shaded] = palette[mats[shaded]]
-    rf.normalize_image(illum, albedo, shaded, image, spec)
+    rf.normalize_image(illum, albedo, shaded, image)
 
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "render_mirror.png")

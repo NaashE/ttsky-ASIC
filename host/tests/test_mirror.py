@@ -16,11 +16,14 @@ print(f"bounce cap {rf.MIRROR_BOUNCES}, "
 # --- the right wall really is the mirror -------------------------------
 material = rf.make_scene()
 G = rf.GRID
-right = material[:G - 1, :, G - 1]
+EW = rf.EDGE_WIDTH
+# Exclude the matte trim along every edge the right wall shares with the
+# front/back/floor/roof mirrors (see make_scene's `edge_zy`), not just the
+# back-wall's own corner column.
+right = material[EW:G - EW, EW:G - EW, G - 1]
 assert np.all(right == rf.MAT_MIRROR), \
     f"right wall is not the mirror: {np.unique(right)}"
 assert rf.REFLECTIVITY[rf.MAT_MIRROR] > 0, "mirror has no reflectivity"
-assert rf.REFLECTIVITY[rf.MAT_WALL_SHINY] == 0, "the shiny wall became a mirror"
 print(f"\nright wall = material {rf.MAT_MIRROR} (mirror)")
 
 # --- reflection law: angle in equals angle out, tangent preserved ------

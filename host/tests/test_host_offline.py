@@ -126,6 +126,13 @@ def main():
                 if rf.is_emissive(material, r):
                     image[idx] = rf.emissive_color(material, r)
                     continue
+                if rf.REFLECTIVITY[rf.hit_material(material, r)] > 0.0:
+                    # This reference path traces primary rays only, with no
+                    # bounce loop. A mirror hit is left black rather than
+                    # diffusely shaded with its own near-white albedo, same
+                    # as how the real renderer treats an exhausted
+                    # reflection chain (see `trapped` in main()).
+                    continue
                 raw[idx] = rf.raw_illumination(r)
                 albedo[idx] = rf.hit_albedo(material, r)
                 hit_mask[idx] = True
@@ -144,18 +151,22 @@ def main():
     assert hits > 0
     assert timeouts == 0, "unexpected timeouts -- MAX_STEPS too low?"
     assert rf.MAT_EMPTY not in mats_hit, "a hit resolved to empty material"
-    # Enclosed box: both spheres, walls, both checker tiles, and the lamp.
-    for expect in (rf.MAT_SPHERE_BIG, rf.MAT_SPHERE_SMALL, rf.MAT_WALL_SHINY,
-                   rf.MAT_MIRROR, rf.MAT_CHECK_LIGHT, rf.MAT_CHECK_DARK,
-                   rf.MAT_LIGHT):
+    # All-mirror box: both spheres and the mirrored enclosure. This path is
+    # primary rays only (no bounce tracing -- see hw_model_trace), and with
+    # the camera now sitting close inside a mostly-mirrored box, a lamp
+    # panel embedded in a side wall is only reliably reached via a bounce,
+    # not guaranteed on a primary ray at this resolution.
+    for expect in (rf.MAT_SPHERE_BIG, rf.MAT_SPHERE_SMALL, rf.MAT_MIRROR):
         assert expect in mats_hit, f"material {expect} not visible"
-    # The emissive panel must render at full brightness and be excluded from
-    # the normalisation, so it should be the brightest thing in the frame.
-    lamp = rf.to_rgb8(rf.PALETTE[rf.MAT_LIGHT])
-    brightest = int(image.astype(int).sum(axis=1).max())
-    assert sum(lamp) >= brightest, (
-        f"lamp {lamp} is not the brightest pixel ({brightest}) -- emissive "
-        f"handling or normalisation is wrong")
+    # Whenever the emissive panel IS directly visible, it must render at full
+    # brightness and be excluded from the normalisation, i.e. be the
+    # brightest thing in the frame.
+    if rf.MAT_LIGHT in mats_hit:
+        lamp = rf.to_rgb8(rf.PALETTE[rf.MAT_LIGHT])
+        brightest = int(image.astype(int).sum(axis=1).max())
+        assert sum(lamp) >= brightest, (
+            f"lamp {lamp} is not the brightest pixel ({brightest}) -- "
+            f"emissive handling or normalisation is wrong")
     # The box encloses the view, so essentially every ray should land on a
     # surface -- stray escapes would show as black bands at the frame edge.
     assert misses < 0.01 * (W * H), f"{misses} rays escaped the enclosure"

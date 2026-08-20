@@ -166,8 +166,7 @@ MAT_CHECK_DARK   = 5
 MAT_LIGHT        = 6
 MAT_LIGHT_COOL   = 7
 MAT_LIGHT_PURE   = 8
-MAT_WALL_SHINY   = 9
-MAT_MIRROR       = 10
+MAT_MIRROR       = 9
 
 # Per-material albedo (linear RGB, each channel 0..1), indexed by material.
 PALETTE = [
@@ -183,8 +182,7 @@ PALETTE = [
                           #   This is only how the panel LOOKS; the colour it
                           #   casts is LIGHT_COOL, set independently below.
     (1.00, 1.00, 1.00),   # 8 neutral lamp  -- pure white, emissive
-    (0.82, 0.80, 0.74),   # 9 shiny wall    -- same albedo as 3, but glossy
-    (0.97, 0.98, 1.00),   # 10 mirror       -- near-white; tints each bounce
+    (0.97, 0.98, 1.00),   # 9 mirror        -- near-white; tints each bounce
 ]
 
 # Fully reflective materials: material -> reflectivity (0..1). A ray landing
@@ -199,30 +197,18 @@ PALETTE = [
 MIRROR = {
     MAT_MIRROR: 0.90,
 }
-MIRROR_BOUNCES = 6
+MIRROR_BOUNCES = 64
 MIRROR_MIN_THROUGHPUT = 1.0 / 255.0     # below one 8-bit step: invisible
+
+# An unresolved mirror ray (open-face escape, step timeout, or trapped at
+# the bounce cap) is shown as its own accumulated throughput tint rather
+# than flat black -- see `ghost`/`trapped` below. This extra factor just
+# knocks that tint down a bit so a bare mirror surface reads as a dim
+# silvery void rather than competing with the objects it reflects.
+MIRROR_VOID_DARKEN = 0.4
 REFLECTIVITY = np.zeros(len(PALETTE), dtype=np.float64)
 for _m, _r in MIRROR.items():
     REFLECTIVITY[_m] = _r
-
-# Specular (Blinn-Phong) per material: (strength, exponent). Anything absent
-# is purely diffuse. The exponent controls tightness -- higher is a smaller,
-# sharper highlight; strength scales how much light the gloss reflects.
-#
-# Costs NO extra rays: the highlight is computed from data the shading loop
-# already has (surface normal, light direction, view direction) and is gated
-# by the same shadow visibility, so a highlight correctly disappears in shade.
-#
-# Caveat of a voxel grid: with only six possible normals a highlight cannot be
-# a round blob -- a whole face lights up at once. On flat axis-aligned walls
-# that looks right; on a curved voxel surface it would look faceted.
-SPECULAR = {
-    MAT_WALL_SHINY: (0.9, 32.0),
-}
-SPEC_STRENGTH = np.zeros(len(PALETTE), dtype=np.float64)
-SPEC_POWER = np.ones(len(PALETTE), dtype=np.float64)
-for _m, (_s, _p) in SPECULAR.items():
-    SPEC_STRENGTH[_m], SPEC_POWER[_m] = _s, _p
 
 # Materials drawn at full brightness with no lighting calculation, and kept
 # out of the illumination normalisation so a bright lamp cannot compress the
@@ -232,6 +218,47 @@ EMISSIVE = frozenset({MAT_LIGHT, MAT_LIGHT_COOL, MAT_LIGHT_PURE})
 # Checker square size in voxels, for the floor and roof planes. Derived from
 # GRID so the board always shows 8 squares per side whatever the grid size.
 CHECKER_SIZE = max(1, GRID // 8)
+
+# Width in voxels of the matte trim painted along each mirror-to-mirror
+# edge of the box (see make_scene). Derived from GRID like CHECKER_SIZE so
+# it scales with the grid instead of becoming vanishingly thin or
+# overwhelming at a different resolution.
+EDGE_WIDTH = max(1, GRID // 64)
+
+# Camera position and aim point, as fractions of GRID so both scale with
+# grid size. The box is fully enclosed now (including the front face at
+# z=0), so the camera sits inside it rather than outside looking in through
+# what used to be an open face -- here, tucked in the top-right-front
+# corner. It is aimed at the sphere cluster rather than the box centre, and
+# the cluster itself is off-axis (the two spheres are not symmetric about
+# any diagonal), so the resulting view angle is a genuinely skewed one, not
+# a tidy 45 degrees on any axis.
+CAMERA_EYE = (GRID * 0.90, GRID * 0.90, EDGE_WIDTH + 6.0)
+CAMERA_TARGET = (GRID * 0.47, GRID * 0.42, GRID * 0.66)
+
+
+def _camera_basis():
+    """Orthonormal (forward, right, up) for CAMERA_EYE looking at
+    CAMERA_TARGET, world up = +y. Computed once at import time so the
+    scalar and vectorised ray generators below share the exact same
+    numbers (see test_vectorised.py)."""
+    forward = np.asarray(CAMERA_TARGET, dtype=np.float64) - np.asarray(
+        CAMERA_EYE, dtype=np.float64)
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, (0.0, 1.0, 0.0))
+    right /= np.linalg.norm(right)
+    up = np.cross(right, forward)
+    return forward, right, up
+
+
+CAMERA_FORWARD, CAMERA_RIGHT, CAMERA_UP = _camera_basis()
+
+# Vertical field of view. Wider spreads more of the scene across the same
+# frame, so each object (spheres included) covers a smaller fraction of the
+# image -- the lever for making things read as farther away without
+# physically moving them, at the cost of more wide-angle edge distortion
+# given how close the camera now sits to the walls.
+CAMERA_FOV_Y_DEG = 80.0
 
 # Light panel geometry, in voxel coordinates. Derived once and used by BOTH
 # the scene builder (which paints the emissive voxels) and the shading (which
@@ -655,20 +682,36 @@ def make_scene():
 
     floor_y, roof_y = 0, GRID - 1
     back_z = GRID - 1
-    check = max(1, CHECKER_SIZE)
 
-    # Floor and roof: checkerboard over the x/z plane.
-    axis = np.arange(GRID)
-    pale = (((axis[None, :] // check) + (axis[:, None] // check)) & 1) == 0
-    tile = np.where(pale, MAT_CHECK_LIGHT, MAT_CHECK_DARK).astype(np.uint8)
-    material[:, floor_y, :] = tile
-    material[:, roof_y, :] = tile
+    # Floor and roof: mirrors, over the x/z plane.
+    material[:, floor_y, :] = MAT_MIRROR
+    material[:, roof_y, :] = MAT_MIRROR
 
-    # Side and back walls, drawn after the floor/roof so the box gets a clean
-    # plain-coloured edge everywhere the planes meet.
-    material[:, :, 0] = MAT_WALL_SHINY        # left wall: glossy
+    # Side, front and back walls, drawn after the floor/roof so the box gets
+    # a clean edge everywhere the planes meet. The front face (z=0) is where
+    # the camera used to sit outside looking in; the camera now sits just
+    # inside it instead (see camera_ray/camera_rays), so this can close
+    # without blocking the view.
+    material[:, :, 0] = MAT_MIRROR            # left wall: mirror
     material[:, :, GRID - 1] = MAT_MIRROR     # right wall: mirror
-    material[back_z, :, :] = MAT_WALL
+    material[0, :, :] = MAT_MIRROR            # front wall: mirror
+    material[back_z, :, :] = MAT_MIRROR       # back wall: mirror
+
+    # Matte trim along every edge where two mirror planes meet, so the box
+    # reads as a room with defined corners instead of one unbroken
+    # reflective shell.
+    near0 = np.arange(GRID) < EDGE_WIDTH
+    near1 = np.arange(GRID) >= GRID - EDGE_WIDTH
+    edge_z = near0[:, None] | near1[:, None]
+    edge_zx = near0[None, :] | near1[None, :] | edge_z
+    material[:, floor_y, :][edge_zx] = MAT_WALL
+    material[:, roof_y, :][edge_zx] = MAT_WALL
+    edge_zy = near0[None, :] | near1[None, :] | edge_z
+    material[:, :, 0][edge_zy] = MAT_WALL
+    material[:, :, GRID - 1][edge_zy] = MAT_WALL
+    edge_yx = near0[None, :] | near1[None, :] | near0[:, None] | near1[:, None]
+    material[0, :, :][edge_yx] = MAT_WALL
+    material[back_z, :, :][edge_yx] = MAT_WALL
 
     # Emissive light panels. The span is 2*half voxels (not 2*half+1): an EVEN
     # count is what centres exactly on an even-sized wall. An odd span would
@@ -1124,18 +1167,22 @@ class RaytracerDevice:
 def camera_rays(width, height):
     """Directions for EVERY pixel at once, row-major (py major, px minor), as
     an (N, 3) array. Same convention as camera_ray() below."""
-    eye = (GRID / 2.0, GRID / 2.0, -GRID * 0.875)
-    fov_y = math.radians(55.0)
+    eye = CAMERA_EYE
+    fov_y = math.radians(CAMERA_FOV_Y_DEG)
     aspect = width / height
     half_h = math.tan(fov_y / 2)
     px = np.arange(width, dtype=np.float64)
     py = np.arange(height, dtype=np.float64)
     ndc_x = (px + 0.5) / width * 2.0 - 1.0
     ndc_y = 1.0 - (py + 0.5) / height * 2.0   # image row 0 = +y (top)
-    dx = np.repeat(ndc_x[None, :] * half_h * aspect, height, axis=0).ravel()
-    dy = np.repeat(ndc_y[:, None] * half_h, width, axis=1).ravel()
-    dz = np.ones(width * height, dtype=np.float64)
-    return eye, np.stack((dx, dy, dz), axis=1)
+    cx = np.repeat(ndc_x[None, :] * half_h * aspect, height, axis=0).ravel()
+    cy = np.repeat(ndc_y[:, None] * half_h, width, axis=1).ravel()
+    cz = np.ones(width * height, dtype=np.float64)
+    # Camera-space (right, up, forward) -> world space, via the fixed basis
+    # for CAMERA_EYE/CAMERA_TARGET (see _camera_basis).
+    dirs = (cx[:, None] * CAMERA_RIGHT + cy[:, None] * CAMERA_UP
+            + cz[:, None] * CAMERA_FORWARD)
+    return eye, dirs
 
 
 def dda_init_batch(eye, dirs):
@@ -1210,15 +1257,20 @@ def dda_row(batch, i):
 
 
 def camera_ray(px, py, width, height):
-    """Perspective camera outside the grid looking down +z at the center.
-    Positioned relative to GRID so framing is identical at any grid size."""
-    eye = (GRID / 2.0, GRID / 2.0, -GRID * 0.875)
-    fov_y = math.radians(55.0)
+    """Perspective camera at CAMERA_EYE, aimed at CAMERA_TARGET (see
+    _camera_basis) -- currently the top-right-front corner of the now fully
+    enclosed box, looking down at the sphere cluster. Positioned relative to
+    GRID so framing is identical at any grid size."""
+    eye = CAMERA_EYE
+    fov_y = math.radians(CAMERA_FOV_Y_DEG)
     aspect = width / height
     half_h = math.tan(fov_y / 2)
     ndc_x = (px + 0.5) / width * 2.0 - 1.0
     ndc_y = 1.0 - (py + 0.5) / height * 2.0   # image row 0 = +y (top)
-    direction = (ndc_x * half_h * aspect, ndc_y * half_h, 1.0)
+    cx, cy, cz = ndc_x * half_h * aspect, ndc_y * half_h, 1.0
+    direction = tuple(
+        cx * CAMERA_RIGHT[j] + cy * CAMERA_UP[j] + cz * CAMERA_FORWARD[j]
+        for j in range(3))
     return eye, direction
 
 
@@ -1495,7 +1547,7 @@ def to_rgb8(color):
     return tuple(min(255, max(0, int(round(c * 255)))) for c in color)
 
 
-def normalize_image(illum, albedo, hit_mask, image, spec=None):
+def normalize_image(illum, albedo, hit_mask, image):
     """Turn per-pixel RGB illumination plus material albedo into final pixels.
 
     Each light's colour is split into a BRIGHTNESS and a TINT:
@@ -1526,12 +1578,8 @@ def normalize_image(illum, albedo, hit_mask, image, spec=None):
     hit_mask = np.asarray(hit_mask, dtype=bool)      # (N,)
     if not hit_mask.any():
         return
-    spec = (np.zeros_like(illum) if spec is None
-            else np.asarray(spec, dtype=np.float64))
 
-    # Brightness is set by the TOTAL light arriving, diffuse plus specular.
-    total = illum + spec
-    mag = total.max(axis=1)
+    mag = illum.max(axis=1)
     lit = mag[hit_mask]
     lo, hi = lit.min(), lit.max()
     span = hi - lo
@@ -1544,14 +1592,9 @@ def normalize_image(illum, albedo, hit_mask, image, spec=None):
     # Unlit pixels have no chromaticity, so fall back to a neutral tint.
     safe = np.maximum(mag, 1e-9)[:, None]
     ok = mag[:, None] > 1e-9
-    diff_tint = np.where(ok, illum / safe, 1.0)
-    spec_tint = np.where(ok, spec / safe, 0.0)
+    tint = np.where(ok, illum / safe, 1.0)
 
-    # Albedo colours the DIFFUSE term only. A gloss highlight is light bounced
-    # off the surface rather than absorbed and re-emitted, so it keeps the
-    # lamp's colour instead of taking on the material's. With spec = 0 this
-    # reduces exactly to the previous albedo * tint * norm.
-    rgb = (albedo * diff_tint + spec_tint) * norm[:, None]
+    rgb = albedo * tint * norm[:, None]
     out = np.clip(np.rint(rgb * 255.0), 0, 255).astype(np.uint8)
     image[hit_mask] = out[hit_mask]
 
@@ -1757,7 +1800,22 @@ def main():
     # ---- classify hits ------------------------------------------------------
 
     image = np.zeros((total, 3), dtype=np.uint8)
-    image[r_timeout & ~r_hit] = np.rint(np.array(COLOR_TIMEOUT) * 255)
+    # A ray that bounced off at least one mirror but never resolved onto a
+    # surface -- whether it ran out of DDA steps mid-chain, or (the common
+    # case here) it got redirected back out through the open camera-facing
+    # face, which reports neither hit nor timeout -- still carries whatever
+    # throughput it accumulated from the mirrors it already left. Show that
+    # residual tint instead of flat black/grey, so a mirror corridor dims
+    # toward a silvery vanishing point instead of a hard void. A ray that
+    # never bounced at all (throughput still exactly 1) is a genuine
+    # non-mirror-related timeout and keeps the flat debug grey.
+    bounced = throughput.min(axis=1) < 1.0
+    ghost = ~r_hit & bounced
+    image[r_timeout & ~r_hit & ~bounced] = np.rint(
+        np.array(COLOR_TIMEOUT) * 255)
+    image[ghost] = np.clip(
+        np.rint(throughput[ghost] * MIRROR_VOID_DARKEN * 255), 0, 255
+    ).astype(np.uint8)
 
     mats = np.zeros(total, dtype=np.uint8)
     mats[r_hit] = material[r_pos[r_hit, 2], r_pos[r_hit, 1], r_pos[r_hit, 0]]
@@ -1768,7 +1826,20 @@ def main():
     image[lamp] = np.clip(
         np.rint(palette[mats[lamp]] * throughput[lamp] * 255), 0, 255
     ).astype(np.uint8)
-    shaded = r_hit & ~lamp
+    # A ray can still be sitting on a mirror when the bounce loop ends (cap
+    # reached, or throughput fell below the floor) -- e.g. trapped in a
+    # corner formed by several mirrors. That is an exhausted reflection
+    # chain, not a surface to diffusely shade -- shading it with full
+    # lighting would paint the mirror's own near-white albedo as if it were
+    # directly lit, which can outshine every real light in the scene (see
+    # `trapped` history). Instead show the accumulated throughput tint, same
+    # as a bounce-leg timeout: a real mirror corridor dims toward a silvery
+    # vanishing point rather than cutting to a hard black void.
+    trapped = r_hit & ~lamp & (REFLECTIVITY[mats] > 0.0)
+    image[trapped] = np.clip(
+        np.rint(throughput[trapped] * MIRROR_VOID_DARKEN * 255), 0, 255
+    ).astype(np.uint8)
+    shaded = r_hit & ~lamp & ~trapped
 
     # ---- lighting, one light sample at a time -------------------------------
     t_shade = time.monotonic()
@@ -1777,7 +1848,6 @@ def main():
     # two isolates the (noisy) visibility from the (sharp) geometric term so
     # only the former gets filtered.
     illum_open = np.zeros((total, 3), dtype=np.float64)
-    spec_illum = np.zeros((total, 3), dtype=np.float64)
     sh_idx = np.nonzero(shaded)[0]
     shadow_rays = 0
 
@@ -1792,15 +1862,6 @@ def main():
                                 r_pos[sh_idx], r_face[sh_idx])
         origins = shadow_origins(hit_pt, r_face[sh_idx])
         pts = hit_pt
-        # View direction (surface -> viewer) and this surface's gloss
-        # parameters. Both are independent of which light is being sampled, so
-        # they are computed once outside the loop. For a reflected pixel the
-        # "viewer" sits at the mirror, so this is the incoming ray reversed.
-        view = -cur_dir[sh_idx] / np.linalg.norm(cur_dir[sh_idx], axis=1,
-                                                 keepdims=True)
-        gloss = SPEC_STRENGTH[mats[sh_idx]]
-        power = SPEC_POWER[mats[sh_idx]]
-        any_gloss = gloss.any()
         for si, stratum in enumerate(LIGHT_STRATA):
             # Each surface point samples its own random spot in this stratum.
             lpos = jitter_strata(stratum, sh_idx.size, rng)
@@ -1839,28 +1900,6 @@ def main():
             illum[rows, 1] += cg * weight
             illum[rows, 2] += cb * weight
 
-            # Blinn-Phong gloss: brightest where the half-vector between the
-            # light and the eye lines up with the surface normal. Uses the
-            # same `weight`, so the highlight is shadowed exactly as the
-            # diffuse term is and vanishes wherever the light is blocked.
-            if any_gloss:
-                g = gloss[face_on]
-                live_g = g > 0.0
-                if live_g.any():
-                    inv = 1.0 / np.maximum(dist[face_on], 1e-9)
-                    hx = dx[face_on] * inv + view[face_on, 0]
-                    hy = dy[face_on] * inv + view[face_on, 1]
-                    hz = dz[face_on] * inv + view[face_on, 2]
-                    hn = np.sqrt(hx * hx + hy * hy + hz * hz)
-                    n_f = normals[face_on]
-                    ndoth = ((n_f[:, 0] * hx + n_f[:, 1] * hy
-                              + n_f[:, 2] * hz) / np.maximum(hn, 1e-9))
-                    np.maximum(ndoth, 0.0, out=ndoth)
-                    s = g * np.power(ndoth, power[face_on]) * weight
-                    spec_illum[rows, 0] += cr * s
-                    spec_illum[rows, 1] += cg * s
-                    spec_illum[rows, 2] += cb * s
-
         # Isolate visibility, smooth it, then re-apply it to the unfiltered
         # geometric term.
         if ENABLE_SHADOWS and SHADOW_FILTER_RADIUS > 0:
@@ -1880,18 +1919,16 @@ def main():
                   f"{time.monotonic() - t_filt:.1f}s")
 
         illum *= LIGHT_INTENSITY
-        spec_illum *= LIGHT_INTENSITY
 
     # Everything reaching the camera passed through every mirror on the way,
     # so scale by throughput BEFORE normalising -- that way the brightness
     # stretch sees the dimming and deep reflections stay correctly darker.
     illum *= throughput
-    spec_illum *= throughput
 
     albedo = np.zeros((total, 3), dtype=np.float64)
     albedo[shaded] = palette[mats[shaded]]
 
-    normalize_image(illum, albedo, shaded, image, spec_illum)
+    normalize_image(illum, albedo, shaded, image)
     print(f"Shade: {time.monotonic() - t_shade:.1f}s  "
           f"({int(r_hit.sum())} hits, {int((~r_hit).sum())} misses, "
           f"{grid_misses} off-grid, {shadow_rays} shadow rays)")
